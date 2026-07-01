@@ -98,7 +98,92 @@ def build_prediction_model(teams, matches, editions):
     results_df['win_probability_%'] = round(results_df['prediction_score'] / total_score * 100, 2)
     return results_df
 
+# ===================================
+# FETCH LIVE ELIMINATION STATUS
+# Checks who is still alive in the tournament
+# using the openfootball live API
+# ===================================
+@st.cache_data(ttl=3600)
+def fetch_elimination_status():
+    """Returns sets of eliminated and still-alive teams from live API"""
+    import requests
+    try:
+        url = "https://raw.githubusercontent.com/openfootball/worldcup.json/master/2026/worldcup.json"
+        r = requests.get(url, timeout=10)
+        if r.status_code != 200:
+            return set(), set(), set()
+        data = r.json()
+        matches = data.get('matches', [])
+
+        knockout_rounds = ['Round of 32', 'Round of 16', 'Quarter-final',
+                           'Semi-final', 'Final', 'Match for third place']
+
+        # Step 1: Find teams that reached Round of 32
+        r32_teams = set()
+        for m in matches:
+            if m.get('round') == 'Round of 32':
+                r32_teams.add(m['team1'])
+                r32_teams.add(m['team2'])
+
+        # Step 2: Find all group stage teams
+        group_teams = set()
+        for m in matches:
+            if m.get('round', '').startswith('Matchday'):
+                group_teams.add(m['team1'])
+                group_teams.add(m['team2'])
+
+        # Teams that didn't make Round of 32 = group stage eliminated
+        group_eliminated = group_teams - r32_teams
+
+        # Step 3: Find knockout eliminated teams
+        knockout_eliminated = set()
+        knockout_alive = set()
+        for m in matches:
+            if m.get('round') in knockout_rounds and m.get('score', {}).get('ft'):
+                ft = m['score']['ft']
+                t1, t2 = m['team1'], m['team2']
+                s1, s2 = ft[0], ft[1]
+                pen = m.get('score', {}).get('pen')
+                if s1 == s2 and pen:
+                    winner = t1 if pen[0] > pen[1] else t2
+                    loser = t2 if pen[0] > pen[1] else t1
+                elif s1 > s2:
+                    winner, loser = t1, t2
+                else:
+                    winner, loser = t2, t1
+                knockout_eliminated.add(loser)
+                knockout_alive.add(winner)
+
+        all_eliminated = group_eliminated | knockout_eliminated
+        return all_eliminated, knockout_alive, group_eliminated
+
+    except Exception:
+        return set(), set(), set()
+
 results_df = build_prediction_model(teams, matches, editions)
+
+# ===================================
+# LIVE PROBABILITY ADJUSTMENT
+# Set eliminated teams to 0% and
+# redistribute among still-alive teams
+# ===================================
+eliminated_teams, knockout_alive, group_eliminated = fetch_elimination_status()
+
+if eliminated_teams:
+    # Set eliminated teams to 0
+    results_df['still_in'] = ~results_df['team'].isin(eliminated_teams)
+    results_df['live_probability_%'] = 0.0
+
+    # Redistribute total probability among still-alive teams only
+    alive_mask = results_df['still_in']
+    total_alive_score = results_df.loc[alive_mask, 'prediction_score'].sum()
+    if total_alive_score > 0:
+        results_df.loc[alive_mask, 'live_probability_%'] = round(
+            results_df.loc[alive_mask, 'prediction_score'] / total_alive_score * 100, 2
+        )
+else:
+    results_df['still_in'] = True
+    results_df['live_probability_%'] = results_df['win_probability_%']
 
 # ===================================
 # SIDEBAR NAVIGATION
@@ -143,15 +228,18 @@ if page == "🏠 Home":
         """
     )
 
-    st.subheader("🔮 Quick Prediction")
-    top3 = results_df.head(3)
+    st.subheader("🔮 Live Prediction")
+    top3 = results_df[results_df['still_in']].head(3)
     cols = st.columns(3)
     medals = ["🥇", "🥈", "🥉"]
     for i, (col, (_, row)) in enumerate(zip(cols, top3.iterrows())):
         with col:
             st.markdown(f"### {medals[i]} {row['team']}")
-            st.metric("Win Probability", f"{row['win_probability_%']}%")
+            st.metric("Live Win Probability", f"{row['live_probability_%']}%")
             st.caption(f"FIFA Rank #{int(row['fifa_rank'])} | {int(row['semi_finals'])} semi-finals | {int(row['titles'])} titles")
+
+    eliminated_count = (~results_df['still_in']).sum()
+    st.caption(f"⚡ Live update: {eliminated_count} teams eliminated so far — probabilities redistributed among remaining {results_df['still_in'].sum()} teams")
 
     st.info("⚠️ This is a data-driven estimate based on historical patterns and FIFA rankings — football is unpredictable, and upsets happen!")
 
@@ -244,23 +332,46 @@ elif page == "🔮 Winner Prediction":
         "World Cup Titles (20%) + Host Advantage (10%)"
     )
 
-    top10 = results_df.head(10)
+    # Show only still-alive teams sorted by live probability
+    alive_df = results_df[results_df['still_in']].copy()
+    alive_df = alive_df.sort_values('live_probability_%', ascending=False)
+    top10 = alive_df.head(10)
+
+    st.subheader(f"🏆 Top Contenders Still In Tournament ({len(alive_df)} teams remaining)")
+
     fig, ax = plt.subplots(figsize=(10, 6))
-    ax.barh(top10['team'][::-1], top10['prediction_score'][::-1], color='steelblue', edgecolor='white')
-    ax.set_xlabel("Prediction Score")
-    for i, (score) in enumerate(top10['prediction_score'][::-1]):
-        ax.text(score + 0.5, i, f"{score:.1f}", va='center', fontweight='bold')
+    ax.barh(top10['team'][::-1], top10['live_probability_%'][::-1],
+            color='steelblue', edgecolor='white')
+    ax.set_xlabel("Live Win Probability (%)")
+    for i, prob in enumerate(top10['live_probability_%'][::-1]):
+        ax.text(prob + 0.2, i, f"{prob:.1f}%", va='center', fontweight='bold')
     st.pyplot(fig)
 
-    st.subheader("Top 10 Contenders — Full Breakdown")
-    display_df = top10[['team', 'confederation', 'fifa_rank', 'semi_finals', 'titles', 'prediction_score', 'win_probability_%']].copy()
-    display_df.columns = ['Team', 'Confederation', 'FIFA Rank', 'Semi-Finals', 'Titles', 'Score', 'Win Probability (%)']
+    # Full table
+    display_df = top10[['team', 'confederation', 'fifa_rank',
+                         'semi_finals', 'titles', 'live_probability_%']].copy()
+    display_df.columns = ['Team', 'Confederation', 'FIFA Rank',
+                          'Semi-Finals', 'Titles', 'Live Win Probability (%)']
     st.dataframe(display_df, use_container_width=True, hide_index=True)
 
+    # Winner announcement
+    winner_row = alive_df.iloc[0]
     st.success(
-        f"🥇 **Predicted Winner: {results_df.iloc[0]['team']}** "
-        f"({results_df.iloc[0]['win_probability_%']}% win probability)"
+        f"🥇 **Current Top Pick: {winner_row['team']}** "
+        f"({winner_row['live_probability_%']}% live win probability)"
     )
+
+    # Show eliminated teams
+    elim_df = results_df[~results_df['still_in']].copy()
+    if len(elim_df) > 0:
+        with st.expander(f"❌ Eliminated Teams ({len(elim_df)})"):
+            elim_display = elim_df[['team', 'confederation',
+                                    'fifa_rank', 'win_probability_%']].copy()
+            elim_display.columns = ['Team', 'Confederation',
+                                    'FIFA Rank', 'Pre-Tournament Probability (%)']
+            st.dataframe(elim_display.sort_values(
+                'Pre-Tournament Probability (%)', ascending=False),
+                use_container_width=True, hide_index=True)
 
     with st.expander("📊 Live Model Validation — How accurate is this model against real 2026 results?"):
 
@@ -408,36 +519,52 @@ elif page == "🔎 Predict Your Country":
 
     if country:
         row = results_df[results_df['team'] == country].iloc[0]
-        rank_position = results_df[results_df['team'] == country].index[0] + 1
+        is_eliminated = not row['still_in']
 
-        col1, col2, col3, col4 = st.columns(4)
-        col1.metric("Win Probability", f"{row['win_probability_%']}%")
-        col2.metric("FIFA Rank", f"#{int(row['fifa_rank'])}")
-        col3.metric("Semi-Finals (history)", f"{int(row['semi_finals'])}")
-        col4.metric("World Cup Titles", f"{int(row['titles'])}")
-
-        st.markdown(f"**Overall Ranking in Our Model:** #{rank_position} out of {len(results_df)} teams")
-
-        if rank_position == 1:
-            st.success(f"🥇 {country} is our model's **top favorite** to win WC 2026!")
-        elif rank_position <= 4:
-            st.success(f"🔥 {country} is a **top contender** — real chance of lifting the trophy!")
-        elif rank_position <= 8:
-            st.info(f"⚡ {country} could realistically reach the **quarter-finals or further**!")
-        elif rank_position <= 16:
-            st.info(f"💪 {country} has a chance to cause upsets in the knockout rounds!")
+        if is_eliminated:
+            st.error(f"❌ **{country} has been eliminated from WC 2026.**")
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric("Pre-Tournament Probability", f"{row['win_probability_%']}%",
+                        delta="Eliminated ❌", delta_color="inverse")
+            col2.metric("FIFA Rank", f"#{int(row['fifa_rank'])}")
+            col3.metric("Semi-Finals (history)", f"{int(row['semi_finals'])}")
+            col4.metric("World Cup Titles", f"{int(row['titles'])}")
         else:
-            st.warning(f"🌟 {country} is an underdog in our model — but upsets happen in football!")
+            alive_df = results_df[results_df['still_in']].sort_values(
+                'live_probability_%', ascending=False).reset_index(drop=True)
+            rank_position = alive_df[alive_df['team'] == country].index[0] + 1
+            remaining = results_df['still_in'].sum()
 
-        st.markdown("---")
-        st.subheader("How does this country compare to the top 5?")
-        compare_df = pd.concat([results_df.head(5), row.to_frame().T]).drop_duplicates(subset='team')
-        fig, ax = plt.subplots(figsize=(8, 4))
-        colors = ['red' if t == country else 'steelblue' for t in compare_df['team']]
-        ax.bar(compare_df['team'], compare_df['prediction_score'].astype(float), color=colors, edgecolor='black')
-        ax.set_ylabel("Prediction Score")
-        plt.xticks(rotation=30, ha='right')
-        st.pyplot(fig)
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric("🔴 Live Win Probability", f"{row['live_probability_%']}%")
+            col2.metric("FIFA Rank", f"#{int(row['fifa_rank'])}")
+            col3.metric("Semi-Finals (history)", f"{int(row['semi_finals'])}")
+            col4.metric("World Cup Titles", f"{int(row['titles'])}")
+
+            st.markdown(f"**Tournament Ranking:** #{rank_position} out of {remaining} remaining teams")
+
+            if rank_position == 1:
+                st.success(f"🥇 {country} is our **top live favourite** to win WC 2026!")
+            elif rank_position <= 4:
+                st.success(f"🔥 {country} is a **top contender** — real chance of the trophy!")
+            elif rank_position <= 8:
+                st.info(f"⚡ {country} could realistically reach the **semi-finals or further!**")
+            else:
+                st.info(f"💪 {country} is still alive — anything can happen in football!")
+
+            st.markdown("---")
+            st.subheader("How does this country compare to other remaining teams?")
+            compare_df = pd.concat([
+                alive_df.head(5),
+                alive_df[alive_df['team'] == country]
+            ]).drop_duplicates(subset='team')
+            fig, ax = plt.subplots(figsize=(8, 4))
+            colors = ['red' if t == country else 'steelblue' for t in compare_df['team']]
+            ax.bar(compare_df['team'], compare_df['live_probability_%'].astype(float),
+                   color=colors, edgecolor='black')
+            ax.set_ylabel("Live Win Probability (%)")
+            plt.xticks(rotation=30, ha='right')
+            st.pyplot(fig)
 
     st.caption("💡 Share this page with friends — let them check their favorite team's chances!")
 
