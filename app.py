@@ -262,25 +262,131 @@ elif page == "🔮 Winner Prediction":
         f"({results_df.iloc[0]['win_probability_%']}% win probability)"
     )
 
-    with st.expander("📊 Model Validation — How accurate is this model?"):
-        st.markdown(
-            """
-            This model was validated against **30 real WC 2026 group stage matches** played through June 28, 2026.
+    with st.expander("📊 Live Model Validation — How accurate is this model against real 2026 results?"):
 
-            - ✅ **16 correct predictions**
-            - ❌ **5 upsets** (model predicted wrong winner)
-            - ⚠️ **9 draws** (rankings alone cannot predict draws)
+        # ===================================
+        # LIVE RESULTS FROM OPENFOOTBALL API
+        # No API key needed — free & updated daily!
+        # ===================================
+        @st.cache_data(ttl=3600)  # Refresh every hour
+        def fetch_live_results():
+            """Fetch live WC 2026 match results from openfootball (free, no key needed)"""
+            import requests
+            try:
+                url = "https://raw.githubusercontent.com/openfootball/worldcup.json/master/2026/worldcup.json"
+                response = requests.get(url, timeout=10)
+                if response.status_code == 200:
+                    data = response.json()
+                    matches_played = []
+                    # All matches are at top level under 'matches' key
+                    for match in data.get("matches", []):
+                        score = match.get("score", {})
+                        if score and score.get("ft"):
+                            ft = score["ft"]
+                            team1 = match.get("team1", "")
+                            team2 = match.get("team2", "")
+                            score1 = ft[0]
+                            score2 = ft[1]
+                            if score1 > score2:
+                                winner = team1
+                            elif score2 > score1:
+                                winner = team2
+                            else:
+                                winner = "Draw"
+                            matches_played.append({
+                                "match": f"{team1} vs {team2}",
+                                "team1": team1,
+                                "team2": team2,
+                                "score": f"{score1}–{score2}",
+                                "actual_winner": winner,
+                                "stage": match.get("round", ""),
+                                "group": match.get("group", "")
+                            })
+                    return matches_played, None
+                else:
+                    return None, f"API returned status {response.status_code}"
+            except Exception as e:
+                return None, str(e)
 
-            **Model Accuracy: 76.2%** on decisive (non-draw) matches — comparable to professional prediction models.
-            """
-        )
-        labels = ['Correct', 'Upset', 'Draw']
-        sizes = [16, 5, 9]
-        colors = ['#2ecc71', '#e74c3c', '#f39c12']
-        fig, ax = plt.subplots(figsize=(5, 5))
-        ax.pie(sizes, labels=labels, colors=colors, autopct='%1.1f%%', startangle=90)
-        ax.set_title("Model Accuracy on Real 2026 Matches")
-        st.pyplot(fig)
+        live_matches, error = fetch_live_results()
+
+        if error or not live_matches:
+            st.warning(f"⚠️ Could not fetch live results right now. Showing last known accuracy.")
+            st.markdown("""
+            **Last known accuracy (June 28, 2026):**
+            - ✅ **16 correct** on 21 decisive matches
+            - 🎯 **Model Accuracy: 76.2%**
+            """)
+        else:
+            # ===================================
+            # MATCH FIFA RANKINGS TO VALIDATE
+            # ===================================
+            team_ranks = dict(zip(teams['team'], teams['fifa_rank']))
+
+            correct = 0
+            wrong = 0
+            draws = 0
+            results_rows = []
+
+            for m in live_matches:
+                t1 = m['team1']
+                t2 = m['team2']
+                rank1 = team_ranks.get(t1, 50)
+                rank2 = team_ranks.get(t2, 50)
+                predicted = t1 if rank1 < rank2 else t2
+                actual = m['actual_winner']
+
+                if actual == "Draw":
+                    result = "⚠️ Draw"
+                    draws += 1
+                elif predicted == actual:
+                    result = "✅ Correct"
+                    correct += 1
+                else:
+                    result = "❌ Upset"
+                    wrong += 1
+
+                results_rows.append({
+                    "Match": m['match'],
+                    "Score": m['score'],
+                    "Predicted": predicted,
+                    "Actual": actual,
+                    "Result": result,
+                    "Stage": m['stage']
+                })
+
+            decisive = correct + wrong
+            accuracy = (correct / decisive * 100) if decisive > 0 else 0
+
+            st.markdown(f"""
+            **Live validation against {len(live_matches)} real WC 2026 matches:**
+            - ✅ **{correct} correct predictions**
+            - ❌ **{wrong} upsets** (model predicted wrong winner)
+            - ⚠️ **{draws} draws** (rankings alone cannot predict draws)
+
+            **🎯 Live Model Accuracy: {accuracy:.1f}%** on decisive matches
+            """)
+
+            col1, col2 = st.columns(2)
+            with col1:
+                labels = ['Correct', 'Upset', 'Draw']
+                sizes = [correct, wrong, draws]
+                colors = ['#2ecc71', '#e74c3c', '#f39c12']
+                fig, ax = plt.subplots(figsize=(4, 4))
+                ax.pie(sizes, labels=labels, colors=colors,
+                       autopct='%1.1f%%', startangle=90)
+                ax.set_title(f"Model Accuracy\n{accuracy:.1f}% on Decisive Matches")
+                st.pyplot(fig)
+
+            with col2:
+                st.markdown("**All results so far:**")
+                df_results = pd.DataFrame(results_rows)
+                st.dataframe(
+                    df_results[['Match', 'Score', 'Predicted', 'Actual', 'Result']],
+                    use_container_width=True, hide_index=True
+                )
+
+            st.caption(f"🔄 Results auto-updated from openfootball (refreshes every hour) • Last fetch: {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M UTC')}")
 
     st.warning(
         "⚠️ **Disclaimer:** This prediction is based on historical patterns and current FIFA rankings. "
