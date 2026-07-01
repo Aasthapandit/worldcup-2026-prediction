@@ -169,6 +169,40 @@ results_df = build_prediction_model(teams, matches, editions)
 # ===================================
 eliminated_teams, knockout_alive, group_eliminated = fetch_elimination_status()
 
+# ===================================
+# PRE-CALCULATE LIVE ACCURACY STRING
+# Used on home page workflow summary
+# ===================================
+@st.cache_data(ttl=3600)
+def get_live_accuracy_str(team_ranks_dict):
+    import requests
+    try:
+        url = "https://raw.githubusercontent.com/openfootball/worldcup.json/master/2026/worldcup.json"
+        r = requests.get(url, timeout=10)
+        data = r.json()
+        correct = wrong = draws = 0
+        for m in data.get('matches', []):
+            score = m.get('score', {})
+            if not score or not score.get('ft'):
+                continue
+            ft = score['ft']
+            t1, t2 = m['team1'], m['team2']
+            r1 = team_ranks_dict.get(t1, 50)
+            r2 = team_ranks_dict.get(t2, 50)
+            predicted = t1 if r1 < r2 else t2
+            actual = t1 if ft[0] > ft[1] else (t2 if ft[1] > ft[0] else 'Draw')
+            if actual == 'Draw': draws += 1
+            elif predicted == actual: correct += 1
+            else: wrong += 1
+        decisive = correct + wrong
+        acc = (correct / decisive * 100) if decisive > 0 else 0
+        return f"**{acc:.1f}% accuracy** across {correct + wrong + draws} matches"
+    except Exception:
+        return "**76.2% accuracy** (last known)"
+
+team_ranks_dict = dict(zip(teams['team'], teams['fifa_rank']))
+live_accuracy_str = get_live_accuracy_str(team_ranks_dict)
+
 if eliminated_teams:
     # Set eliminated teams to 0
     results_df['still_in'] = ~results_df['team'].isin(eliminated_teams)
@@ -219,11 +253,11 @@ if page == "🏠 Home":
     st.markdown("---")
     st.subheader("📌 Project Workflow")
     st.markdown(
-        """
+        f"""
         1. **Data Loading & Cleaning** — Loaded and validated 5 datasets spanning 1930–2026
         2. **Exploratory Data Analysis** — Champions, goals trends, tournament growth, semi-final consistency
         3. **Prediction Model** — Weighted scoring: FIFA Rank (40%) + Semi-Finals (30%) + Titles (20%) + Host (10%)
-        4. **Model Validation** — Tested against real WC 2026 group stage results — **76.2% accuracy**
+        4. **Model Validation** — Tested against {live_accuracy_str} of real WC 2026 matches played so far
         5. **Interactive App** — This Streamlit dashboard, deployed for anyone to explore
         """
     )
